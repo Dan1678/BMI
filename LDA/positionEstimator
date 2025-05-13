@@ -1,0 +1,109 @@
+function [x, y] = positionEstimator(test_data, modelParameters)
+    persistent trialState
+    
+    if isempty(trialState)
+        trialState = struct();
+    end
+
+    tID = test_data.trialId;
+    
+    if ~isfield(trialState, ['tid_' num2str(tID)])
+        % Classification Pipeline
+        spikes = test_data.spikes(:, 1:320);
+        spikes_mean = mean(spikes, 2)';
+
+        % Scale data
+        X_scaled = (spikes_mean - modelParameters.mu) ./ modelParameters.sigma;
+
+        % Binary classification
+        Y_pred_binary = manual_lda_predict(modelParameters.binary_model, X_scaled);
+
+        % Hybrid prediction
+        if Y_pred_binary == 1 % (2-6) group
+            X_scaled_1to5 = (spikes_mean - modelParameters.mu_1to5) ./ modelParameters.sigma_1to5;
+            X_pca_1to5 = X_scaled_1to5 * modelParameters.coeff_1to5;
+            direction_id = manual_lda_predict(modelParameters.lda_1to5, X_pca_1to5) + 1; % Convert 1-5 to 2-6
+        elseif Y_pred_binary == 2 % (7) class
+            direction_id = 7;
+        else % (1,8) group
+            X_scaled_07 = (spikes_mean - modelParameters.mu_07) ./ modelParameters.sigma_07;
+            X_pca_07 = X_scaled_07 * modelParameters.coeff_07;
+            direction_id = manual_knn_predict(modelParameters.knn_07, X_pca_07);
+        end
+
+        % Initialize state
+        s.direction_id = direction_id;
+        s.startHandPos = test_data.startHandPos;
+        s.initialAvgPos = modelParameters.avgTrajectory{direction_id}(:,1);
+        s.currentTime = 0;
+        trialState.(['tid_' num2str(tID)]) = s;
+    end
+
+    % Retrieve state
+    s = trialState.(['tid_' num2str(tID)]);
+
+    % Current time
+    T = size(test_data.spikes, 2);
+
+    % Map time to average trajectory
+    direction_id = s.direction_id;
+    avgTraj = modelParameters.avgTrajectory{direction_id};
+    Tangle = size(avgTraj, 2);
+    if T > Tangle
+        T = Tangle;
+    end
+    
+    % Compute position
+    offset = avgTraj(:,T) - avgTraj(:,1);
+    x = s.startHandPos(1) + offset(1);
+    y = s.startHandPos(2) + offset(2);
+
+    % Update state
+    s.currentTime = T;
+    trialState.(['tid_' num2str(tID)]) = s;
+
+    % Helper Functions
+    function Y_pred = manual_lda_predict(lda_model, X)
+        class_means = lda_model.class_means;
+        inv_Sw = lda_model.inv_Sw;
+        priors = lda_model.priors;
+        k = size(class_means,1);
+        n_samples = size(X,1);
+        discriminant = zeros(n_samples, k);
+        for i = 1:k
+            mu_k = class_means(i,:);
+            term1 = X * inv_Sw * mu_k';
+            term2 = 0.5 * mu_k * inv_Sw * mu_k';
+            discriminant(:,i) = term1 - term2 + log(priors(i));
+        end
+        [~, idx] = max(discriminant, [], 2);
+        Y_pred = lda_model.classes(idx);
+    end
+
+    function Y_pred = manual_knn_predict(knn_model, X)
+        X_train = knn_model.X_train;
+        Y_train = knn_model.Y_train;
+        k = knn_model.k;
+        n_samples = size(X,1);
+        Y_pred = zeros(n_samples,1);
+        for i = 1:n_samples
+            dist = sum((X_train - X(i,:)).^2, 2); % Euclidean distance squared
+            [~, idx] = sort(dist);
+            neighbors = Y_train(idx(1:k));
+            Y_pred(i) = manual_mode(neighbors);
+        end
+    end
+
+    function m = manual_mode(x)
+        unique_x = unique(x);
+        max_count = 0;
+        m = unique_x(1);
+        for i = 1:length(unique_x)
+            count = sum(x == unique_x(i));
+            if count > max_count
+                max_count = count;
+                m = unique_x(i);
+            end
+        end
+    end
+end
